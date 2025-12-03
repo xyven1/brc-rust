@@ -14,28 +14,37 @@ use memmap2::{Advice, Mmap};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 fn main() -> anyhow::Result<()> {
-    let file = File::open("measurements.txt")?;
-    let map = unsafe { Mmap::map(&file) }?;
-    map.advise(Advice::Sequential)?;
-    map.advise(Advice::HugePage)?;
-    map.advise(Advice::WillNeed)?;
+    let file = File::open("./measurements.txt")
+        .context("Failed to open measurements file at ./measurements.txt")?;
+    // SAFTEY: This file won't be modified while.
+    let map = unsafe { Mmap::map(&file) }.context("Failed to mmap measurements file")?;
+    for advice in [Advice::Sequential, Advice::HugePage, Advice::WillNeed] {
+        map.advise(advice)
+            .with_context(|| format!("Failed to advice kernel that mmap should be {:?}", advice))?;
+    }
 
     let cores = available_parallelism().context("Unable to get number of cores")?;
-    let chunks = chunk_data(&map, cores, b'\n')?;
+    eprintln!("Using {cores} cores");
+    let chunks = chunk_data(&map, cores, b'\n');
     let results = chunks
         .into_par_iter()
-        .map(process_chunk)
-        .collect::<Result<Vec<_>>>()?;
+        .map(|chunk| {
+            eprintln!("Processing chunk {} bytes", chunk.len());
+            process_chunk(chunk)
+        })
+        .collect::<Result<Vec<_>>>()
+        .context("One or more chunks could not be processed")?;
 
     let total: u32 = results.iter().map(|(v, _)| v).sum();
     eprintln!("Total lines processed: {total}");
 
     let merged_and_sorted = merge_and_sort(results.into_iter().flat_map(|(_, v)| v));
-    display(merged_and_sorted)?;
+    println!("Num stations: {}", merged_and_sorted.len());
+    display(merged_and_sorted).context("Failed to display results")?;
     Ok(())
 }
 
-fn chunk_data(data: &[u8], parts: NonZero<usize>, needle: u8) -> Result<Box<[&[u8]]>> {
+fn chunk_data(data: &[u8], parts: NonZero<usize>, needle: u8) -> Box<[&[u8]]> {
     let mut chunks = Vec::with_capacity(parts.get());
     let jump = data.len() / parts;
     let mut data = data;
@@ -51,7 +60,7 @@ fn chunk_data(data: &[u8], parts: NonZero<usize>, needle: u8) -> Result<Box<[&[u
         data = &data[idx + 1..];
     }
     chunks.push(data);
-    Ok(chunks.into_boxed_slice())
+    chunks.into_boxed_slice()
 }
 
 fn process_chunk(data: &[u8]) -> Result<(u32, impl Iterator<Item = (&[u8], Stat)>)> {
@@ -80,7 +89,7 @@ fn process_chunk(data: &[u8]) -> Result<(u32, impl Iterator<Item = (&[u8], Stat)
 
 fn merge_and_sort<'a>(
     unsorted_with_dups: impl Iterator<Item = (&'a [u8], Stat)>,
-) -> impl Iterator<Item = (&'a [u8], Stat)> {
+) -> impl ExactSizeIterator<Item = (&'a [u8], Stat)> {
     let mut merged = HashMap::with_capacity(10_000);
     for (key, value) in unsorted_with_dups {
         merged
