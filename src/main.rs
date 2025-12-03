@@ -3,6 +3,7 @@ use std::{
     fmt::Display,
     fs::File,
     io::{BufWriter, Write, stdout},
+    num::NonZero,
     thread::available_parallelism,
 };
 
@@ -19,7 +20,7 @@ fn main() -> anyhow::Result<()> {
     map.advise(Advice::HugePage)?;
     map.advise(Advice::WillNeed)?;
 
-    let (totals, tables) = split(&map, available_parallelism()?.get(), b'\n')?
+    let (totals, tables) = split(&map, available_parallelism()?, b'\n')?
         .into_par_iter()
         .map(|chunk| {
             eprintln!("Processing chunk of {} bytes", chunk.len());
@@ -50,19 +51,16 @@ fn main() -> anyhow::Result<()> {
             writer.write_all(b", ")?;
         }
     }
-    writer.write_all(b"}")?;
+    writer.write_all(b"}\n")?;
     Ok(())
 }
 
-fn split(data: &[u8], parts: usize, needle: u8) -> Result<Box<[&[u8]]>> {
-    let mut chunks = Vec::with_capacity(parts);
+fn split(data: &[u8], parts: NonZero<usize>, needle: u8) -> Result<Box<[&[u8]]>> {
+    let mut chunks = Vec::with_capacity(parts.get());
     let jump = data.len() / parts;
     let mut data = data;
     loop {
-        if chunks.len() == parts - 1 {
-            break;
-        }
-        if data.len() <= jump {
+        if chunks.len() == parts.get() - 1 || data.len() <= jump {
             break;
         }
         let Some(idx) = memchr(needle, &data[jump..]) else {
@@ -106,11 +104,15 @@ impl Stat {
 }
 impl Display for Stat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut avg = (self.total as f32 / self.count as f32).round();
+        if avg == -0. {
+            avg = 0.
+        }
         write!(
             f,
             "{:.1}/{:.1}/{:.1}",
             self.min as f32 / 10.,
-            self.total as f32 / 10. / self.count as f32,
+            avg / 10.,
             self.max as f32 / 10.
         )
     }
