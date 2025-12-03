@@ -16,11 +16,11 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 fn main() -> anyhow::Result<()> {
     let file = File::open("./measurements.txt")
         .context("Failed to open measurements file at ./measurements.txt")?;
-    // SAFTEY: This file won't be modified while.
+    // SAFTEY: This file won't be modified while in use.
     let map = unsafe { Mmap::map(&file) }.context("Failed to mmap measurements file")?;
     for advice in [Advice::Sequential, Advice::HugePage, Advice::WillNeed] {
         map.advise(advice)
-            .with_context(|| format!("Failed to advice kernel that mmap should be {:?}", advice))?;
+            .with_context(|| format!("Failed to advise kernel about mmap: advise {advice:?}"))?;
     }
 
     let cores = available_parallelism().context("Unable to get number of cores")?;
@@ -40,7 +40,7 @@ fn main() -> anyhow::Result<()> {
 
     let merged_and_sorted = merge_and_sort(results.into_iter().flat_map(|(_, v)| v));
     println!("Num stations: {}", merged_and_sorted.len());
-    display(merged_and_sorted).context("Failed to display results")?;
+    print(merged_and_sorted).context("Failed to display results")?;
     Ok(())
 }
 
@@ -48,16 +48,13 @@ fn chunk_data(data: &[u8], parts: NonZero<usize>, needle: u8) -> Box<[&[u8]]> {
     let mut chunks = Vec::with_capacity(parts.get());
     let jump = data.len() / parts;
     let mut data = data;
-    loop {
-        if chunks.len() == parts.get() - 1 || data.len() <= jump {
-            break;
-        }
-        let Some(idx) = memchr(needle, &data[jump..]) else {
-            break;
-        };
-        let idx = jump + idx;
-        chunks.push(&data[..idx + 1]);
-        data = &data[idx + 1..];
+    while chunks.len() < parts.get() - 1
+        && data.len() > jump
+        && let Some(offset) = memchr(needle, &data[jump..])
+    {
+        let (chunk, rest) = data.split_at(jump + offset + 1);
+        chunks.push(chunk);
+        data = rest;
     }
     chunks.push(data);
     chunks.into_boxed_slice()
@@ -75,7 +72,8 @@ fn process_chunk(data: &[u8]) -> Result<(u32, impl Iterator<Item = (&[u8], Stat)
         }
         total += 1;
         let idx = memchr(b';', line).context("No semicolon in line")?;
-        let (before, after) = (&line[..idx], &line[idx + 1..]);
+        let before = line.get(..idx).context("index out of bounds")?;
+        let after = line.get(idx + 1..).context("index out of bounds")?;
         let num = parse_number(after)?;
         match results.get_mut(before) {
             Some(r) => r.update(num),
@@ -100,8 +98,8 @@ fn merge_and_sort<'a>(
     BTreeMap::from_iter(merged).into_iter()
 }
 
-fn display<'a>(sorted_items: impl Iterator<Item = (&'a [u8], Stat)>) -> Result<()> {
-    let mut writer = BufWriter::new(stdout());
+fn print<'a>(sorted_items: impl Iterator<Item = (&'a [u8], Stat)>) -> Result<()> {
+    let mut writer = BufWriter::new(stdout().lock());
     writer.write_all(b"{")?;
     let mut peekable = sorted_items.peekable();
     while let Some((station, stat)) = peekable.next() {
@@ -116,12 +114,12 @@ fn display<'a>(sorted_items: impl Iterator<Item = (&'a [u8], Stat)>) -> Result<(
 }
 
 fn parse_number(data: &[u8]) -> Result<i16> {
-    let negative = if data.first() == Some(&b'-') { -1 } else { 1 };
-    Ok(match data[if negative < 1 { 1 } else { 0 }..] {
+    let negative = data.first() == Some(&b'-');
+    Ok(match data[usize::from(negative)..] {
         [ones @ b'0'..=b'9', b'.', decimal @ b'0'..=b'9'] => {
             let ones = (ones - b'0') as i16;
             let frac = (decimal - b'0') as i16;
-            (ones * 10 + frac) * negative
+            (ones * 10 + frac) * (i16::from(negative) * 2 - 1)
         }
         [
             tens @ b'0'..=b'9',
@@ -132,7 +130,7 @@ fn parse_number(data: &[u8]) -> Result<i16> {
             let tens = (tens - b'0') as i16;
             let ones = (ones - b'0') as i16;
             let frac = (decimal - b'0') as i16;
-            (tens * 100 + ones * 10 + frac) * negative
+            (tens * 100 + ones * 10 + frac) * (i16::from(negative) * 2 - 1)
         }
         _ => anyhow::bail!("invalid number format"),
     })
