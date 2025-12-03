@@ -15,47 +15,27 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 fn main() -> anyhow::Result<()> {
     let file = File::open("measurements.txt")?;
-    let map = unsafe { Mmap::map(&file)? };
+    let map = unsafe { Mmap::map(&file) }?;
     map.advise(Advice::Sequential)?;
     map.advise(Advice::HugePage)?;
     map.advise(Advice::WillNeed)?;
 
-    let (totals, tables) = split(&map, available_parallelism()?, b'\n')?
+    let cores = available_parallelism().context("Unable to get number of cores")?;
+    let chunks = chunk_data(&map, cores, b'\n')?;
+    let results = chunks
         .into_par_iter()
-        .map(|chunk| {
-            eprintln!("Processing chunk of {} bytes", chunk.len());
-            process_chunk(chunk)
-        })
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .unzip::<_, _, Vec<_>, Vec<_>>();
+        .map(process_chunk)
+        .collect::<Result<Vec<_>>>()?;
 
-    let total: u32 = totals.iter().sum();
+    let total: u32 = results.iter().map(|(v, _)| v).sum();
     eprintln!("Total lines processed: {total}");
 
-    let mut sorted = BTreeMap::new();
-    for (key, value) in tables.into_iter().flatten() {
-        sorted
-            .entry(key)
-            .and_modify(|v: &mut Stat| v.merge(&value))
-            .or_insert(value);
-    }
-
-    let mut writer = BufWriter::new(stdout());
-    writer.write_all(b"{")?;
-    let mut peekable = sorted.into_iter().peekable();
-    while let Some((station, stat)) = peekable.next() {
-        writer.write_all(station)?;
-        write!(writer, "={stat}")?;
-        if peekable.peek().is_some() {
-            writer.write_all(b", ")?;
-        }
-    }
-    writer.write_all(b"}\n")?;
+    let merged_and_sorted = merge_and_sort(results.into_iter().flat_map(|(_, v)| v));
+    display(merged_and_sorted)?;
     Ok(())
 }
 
-fn split(data: &[u8], parts: NonZero<usize>, needle: u8) -> Result<Box<[&[u8]]>> {
+fn chunk_data(data: &[u8], parts: NonZero<usize>, needle: u8) -> Result<Box<[&[u8]]>> {
     let mut chunks = Vec::with_capacity(parts.get());
     let jump = data.len() / parts;
     let mut data = data;
@@ -72,6 +52,81 @@ fn split(data: &[u8], parts: NonZero<usize>, needle: u8) -> Result<Box<[&[u8]]>>
     }
     chunks.push(data);
     Ok(chunks.into_boxed_slice())
+}
+
+fn process_chunk(data: &[u8]) -> Result<(u32, impl Iterator<Item = (&[u8], Stat)>)> {
+    let mut results = HashMap::<&[u8], Stat>::with_capacity(10_000);
+    let mut total = 0;
+    let mut data = data;
+    while let Some(idx) = memchr(b'\n', data) {
+        let line = &data[..idx];
+        data = &data[idx + 1..];
+        if line.is_empty() {
+            break;
+        }
+        total += 1;
+        let idx = memchr(b';', line).context("No semicolon in line")?;
+        let (before, after) = (&line[..idx], &line[idx + 1..]);
+        let num = parse_number(after)?;
+        match results.get_mut(before) {
+            Some(r) => r.update(num),
+            None => {
+                results.insert(before, Stat::new(num));
+            }
+        }
+    }
+    Ok((total, results.into_iter()))
+}
+
+fn merge_and_sort<'a>(
+    unsorted_with_dups: impl Iterator<Item = (&'a [u8], Stat)>,
+) -> impl Iterator<Item = (&'a [u8], Stat)> {
+    let mut merged = HashMap::with_capacity(10_000);
+    for (key, value) in unsorted_with_dups {
+        merged
+            .entry(key)
+            .and_modify(|v: &mut Stat| v.merge(&value))
+            .or_insert(value);
+    }
+    BTreeMap::from_iter(merged).into_iter()
+}
+
+fn display<'a>(sorted_items: impl Iterator<Item = (&'a [u8], Stat)>) -> Result<()> {
+    let mut writer = BufWriter::new(stdout());
+    writer.write_all(b"{")?;
+    let mut peekable = sorted_items.peekable();
+    while let Some((station, stat)) = peekable.next() {
+        writer.write_all(station)?;
+        write!(writer, "={stat}")?;
+        if peekable.peek().is_some() {
+            writer.write_all(b", ")?;
+        }
+    }
+    writer.write_all(b"}\n")?;
+    Ok(())
+}
+
+fn parse_number(data: &[u8]) -> Result<i16> {
+    let negative = if data.first() == Some(&b'-') { -1 } else { 1 };
+    Ok(match data[if negative < 1 { 1 } else { 0 }..] {
+        [ones @ b'0'..=b'9', b'.', decimal @ b'0'..=b'9'] => {
+            let ones = (ones - b'0') as i16;
+            let frac = (decimal - b'0') as i16;
+            (ones * 10 + frac) * negative
+        }
+        [
+            tens @ b'0'..=b'9',
+            ones @ b'0'..=b'9',
+            b'.',
+            decimal @ b'0'..=b'9',
+        ] => {
+            let tens = (tens - b'0') as i16;
+            let ones = (ones - b'0') as i16;
+            let frac = (decimal - b'0') as i16;
+            (tens * 100 + ones * 10 + frac) * negative
+        }
+        _ => anyhow::bail!("invalid number format"),
+    })
 }
 
 struct Stat {
@@ -104,7 +159,7 @@ impl Stat {
 }
 impl Display for Stat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut avg = (self.total as f32 / self.count as f32).round();
+        let mut avg = (self.total as f32 / self.count as f32).round() / 10.;
         if avg == -0. {
             avg = 0.
         }
@@ -112,58 +167,8 @@ impl Display for Stat {
             f,
             "{:.1}/{:.1}/{:.1}",
             self.min as f32 / 10.,
-            avg / 10.,
+            avg,
             self.max as f32 / 10.
         )
     }
-}
-
-fn process_chunk(data: &[u8]) -> Result<(u32, HashMap<&[u8], Stat>)> {
-    let mut results = HashMap::<&[u8], Stat>::with_capacity(10_000);
-    let mut total = 0;
-    let mut data = data;
-    while let Some(idx) = memchr(b'\n', data) {
-        let line = &data[..idx];
-        data = &data[idx + 1..];
-        if line.is_empty() {
-            break;
-        }
-        total += 1;
-        if total % 10_000_000 == 0 {
-            eprintln!("Processed {total} lines...");
-        };
-        let idx = memchr(b';', line).context("No semicolon in line")?;
-        let (before, after) = (&line[..idx], &line[idx + 1..]);
-        let num = parse_number(after)?;
-        match results.get_mut(before) {
-            Some(r) => r.update(num),
-            None => {
-                results.insert(before, Stat::new(num));
-            }
-        }
-    }
-    Ok((total, results))
-}
-
-fn parse_number(data: &[u8]) -> Result<i16> {
-    let negative = if data.first() == Some(&b'-') { -1 } else { 1 };
-    Ok(match data[if negative < 1 { 1 } else { 0 }..] {
-        [ones @ b'0'..=b'9', b'.', decimal @ b'0'..=b'9'] => {
-            let ones = (ones - b'0') as i16;
-            let frac = (decimal - b'0') as i16;
-            (ones * 10 + frac) * negative
-        }
-        [
-            tens @ b'0'..=b'9',
-            ones @ b'0'..=b'9',
-            b'.',
-            decimal @ b'0'..=b'9',
-        ] => {
-            let tens = (tens - b'0') as i16;
-            let ones = (ones - b'0') as i16;
-            let frac = (decimal - b'0') as i16;
-            (tens * 100 + ones * 10 + frac) * negative
-        }
-        _ => anyhow::bail!("invalid number format"),
-    })
 }
