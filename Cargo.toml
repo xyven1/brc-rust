@@ -7,7 +7,9 @@ edition = "2024"
 ahash = "0.8.12"
 anyhow = "1.0.100"
 gxhash = "3.5.0"
+memchr = "2.7.6"
 memmap2 = "0.9.9"
+rayon = "1.11.0"
 
 [profile.fast]
 inherits = "release"
